@@ -14,8 +14,16 @@ né un'accelerazione 3D.
 
 - **Scelta della sorgente**: dispositivo video, ingresso (Composito / S-Video),
   standard TV (PAL, NTSC, SECAM...), formato pixel, risoluzione e fotogrammi al secondo.
-- **Audio**: schede ALSA (l'audio della scheda USB viene abbinato in automatico al
-  video), sorgenti PulseAudio/PipeWire, mono/stereo, ascolto dagli altoparlanti.
+- **Audio dalla scheda di acquisizione**: la voce predefinita è "Audio della scheda
+  di acquisizione (automatico)". A ogni avvio il programma cerca l'ingresso audio che
+  appartiene alla stessa periferica USB del video, quindi funziona anche se la
+  numerazione delle schede audio cambia dopo un riavvio. Usa il formato nativo della
+  scheda (canali e frequenza), attiva da solo l'ingresso di registrazione se la
+  scheda parte muta e ne permette di regolare il volume nella scheda *Regolazioni*.
+  Se l'audio della scheda non viene trovato, il programma lo segnala in rosso e
+  chiede conferma prima di registrare senza audio. Si possono comunque scegliere
+  a mano altre schede ALSA o sorgenti PulseAudio/PipeWire. C'è anche l'ascolto
+  dagli altoparlanti.
 - **Anteprima dal vivo** e **VU-meter a LED** con indicatore di CLIP.
 - **Contatore stile videoregistratore**, dimensione del file, fotogrammi al secondo,
   fotogrammi persi o duplicati, spazio libero e **tempo di registrazione rimanente**.
@@ -111,7 +119,7 @@ Se non hai ancora la scheda puoi provare tutto con "Segnale di prova".
 | "Permission denied" | `sudo usermod -aG video,audio $USER`, poi esci e rientra. |
 | "Device or resource busy" | Chiudi gli altri programmi che usano la webcam o l'audio. Prova la sorgente PulseAudio/PipeWire. |
 | Immagine in bianco e nero o che scorre | Standard TV sbagliato: scegli PAL (o NTSC) e 720x576 a 25 fps. |
-| Nessun audio | Scegli la voce "USB Audio" o simile in *Audio*; alcune schede economiche hanno l'audio mono. |
+| Nessun audio | Controlla che i cavi audio (bianco/rosso) vadano nella scheda USB. In *Sorgente* sotto "Audio" deve comparire il nome della scheda; poi alza il volume in *Regolazioni*. Con `python3 acquisitore.py --elenco` vedi quale audio è abbinato. |
 | Audio distorto (CLIP) | Abbassa il volume dell'uscita del videoregistratore, se possibile, o il controllo "Volume audio" in *Regolazioni*. |
 
 I messaggi completi di ffmpeg sono nella scheda **Registro**.

@@ -39,6 +39,7 @@ CONFIG_FILE = os.path.join(CONFIG_DIR, "impostazioni.json")
 
 TEST_SOURCE = "test"
 NO_AUDIO = "none"
+CARD_AUDIO = "card"   # audio della scheda di acquisizione stessa (rilevato a ogni avvio)
 
 
 def default_output_dir():
@@ -56,9 +57,9 @@ DEFAULTS = {
     "input_format": "",
     "video_size": "720x576",
     "framerate": "25",
-    "audio_device": "",
-    "audio_channels": "2",
-    "audio_rate": "48000",
+    "audio_device": CARD_AUDIO,
+    "audio_channels": "auto",
+    "audio_rate": "auto",
     "audio_monitor": False,
     "output_dir": default_output_dir(),
     "name_template": "Cassetta_%Y-%m-%d_%H-%M",
@@ -367,8 +368,8 @@ def list_video_devices(ff):
 
 
 def list_audio_devices(ff):
-    """Restituisce [(valore, etichetta, percorso_usb)]."""
-    res = []
+    """Restituisce [(valore, etichetta, percorso_usb, info_scheda_alsa)]."""
+    res = [(CARD_AUDIO, "Audio della scheda di acquisizione (automatico)", None, None)]
     if "alsa" in ff.demuxers:
         cards = {}
         for m in re.finditer(r"^\s*(\d+)\s+\[(\S+)\s*\]:\s*(\S+)\s*-\s*(.*)$",
@@ -382,17 +383,105 @@ def list_audio_devices(ff):
             cid, driver, longname = cards.get(num, (num, "", "Scheda " + num))
             value = "alsa:plughw:CARD=%s,DEV=%d" % (cid, devn)
             label = "%s - %s  (ALSA hw:%s,%d)" % (longname, pcmname, num, devn)
-            res.append((value, label, usb_parent("/sys/class/sound/card%s/device" % num)))
-        res.append(("alsa:default", "ALSA predefinito", None))
+            info = {"num": num, "id": cid, "driver": driver, "name": longname}
+            res.append((value, label, usb_parent("/sys/class/sound/card%s/device" % num),
+                        info))
+        res.append(("alsa:default", "ALSA predefinito", None, None))
     if "pulse" in ff.demuxers and shutil.which("pactl"):
         _, out = run_cmd(["pactl", "list", "short", "sources"], timeout=5)
         for line in out.splitlines():
             cols = line.split("\t")
             if len(cols) >= 2 and not cols[1].endswith(".monitor"):
-                res.append(("pulse:" + cols[1], "PulseAudio/PipeWire: " + cols[1], None))
-    res.append((TEST_SOURCE, "Segnale di prova (tono 440 Hz)", None))
-    res.append((NO_AUDIO, "Nessun audio", None))
+                res.append(("pulse:" + cols[1], "PulseAudio/PipeWire: " + cols[1], None,
+                            None))
+    res.append((TEST_SOURCE, "Segnale di prova (tono 440 Hz)", None, None))
+    res.append((NO_AUDIO, "Nessun audio", None, None))
     return res
+
+
+# Driver audio tipici delle schede di acquisizione video
+CAPTURE_AUDIO_DRIVERS = ("usb-audio", "em28xx", "stk1160", "cx231xx", "usbtv", "go7007",
+                         "tm6000", "au0828", "hdpvr", "saa7134", "cx88", "bt87x")
+
+
+def find_card_audio(audio_devices, video_dev):
+    """Trova l'ingresso audio che appartiene alla scheda di acquisizione video.
+
+    1) stessa periferica USB fisica del video (metodo sicuro);
+    2) altrimenti una scheda audio con un driver tipico delle schede di acquisizione;
+    3) altrimenti una scheda audio USB qualsiasi.
+    """
+    alsa = [a for a in audio_devices if a[3]]
+    if video_dev is not None and video_dev.usb:
+        for a in alsa:
+            if a[2] and a[2] == video_dev.usb:
+                return a
+    for a in alsa:
+        drv = a[3]["driver"].lower()
+        if any(drv.startswith(x) for x in CAPTURE_AUDIO_DRIVERS):
+            return a
+    for a in alsa:
+        if a[2]:
+            return a
+    return None
+
+
+def alsa_native_format(card_num):
+    """(canali, frequenza) nativi dell'ingresso audio USB, se dichiarati dal driver."""
+    txt = read_file("/proc/asound/card%s/stream0" % card_num)
+    i = txt.find("Capture:")
+    if i < 0:
+        return None
+    sec = txt[i:]
+    m_ch = re.search(r"Channels:\s*(\d+)", sec)
+    m_rt = re.search(r"Rates:\s*(.+)", sec)
+    if not m_ch or not m_rt:
+        return None
+    ch = int(m_ch.group(1))
+    nums = [int(x) for x in re.findall(r"\d+", m_rt.group(1))]
+    if not nums:
+        return None
+    if "continuous" in m_rt.group(1) and len(nums) >= 2:
+        rate = 48000 if nums[0] <= 48000 <= nums[1] else nums[1]
+    elif 48000 in nums:
+        rate = 48000
+    elif 44100 in nums:
+        rate = 44100
+    else:
+        rate = max(nums)
+    return ch, rate
+
+
+def alsa_capture_controls(card_id):
+    """Controlli di registrazione del mixer ALSA: [(nome, percentuale, ha_interruttore, attivo)]."""
+    if not shutil.which("amixer"):
+        return []
+    rc, out = run_cmd(["amixer", "-c", card_id], timeout=5)
+    if rc != 0:
+        return []
+    res = []
+    for block in re.split(r"^Simple mixer control ", out, flags=re.M)[1:]:
+        m = re.match(r"'(.+?)',(\d+)", block)
+        mc = re.search(r"Capabilities:(.*)", block)
+        if not m or not mc:
+            continue
+        caps = mc.group(1).split()
+        if "cvolume" not in caps and "cswitch" not in caps:
+            continue
+        name = m.group(1) if m.group(2) == "0" else "%s,%s" % (m.group(1), m.group(2))
+        mp = re.search(r"Capture \d+ \[(\d+)%\]", block)
+        pct = int(mp.group(1)) if mp and "cvolume" in caps else None
+        on = "[off]" not in block
+        res.append((name, pct, "cswitch" in caps, on))
+    return res
+
+
+def alsa_set_capture(card_id, name, percent=None):
+    args = ["amixer", "-q", "-c", card_id, "sset", name]
+    if percent is not None:
+        args.append("%d%%" % percent)
+    args.append("cap")
+    return run_cmd(args, timeout=5)[0] == 0
 
 
 # --------------------------------------------------------------------------
@@ -413,7 +502,9 @@ def build_ffmpeg_cmd(ff, cfg, record_path=None, meter_fd=None, preview_fps=12,
     size = cfg["video_size"] or "720x576"
     fps = FPS_VALUES.get(cfg["framerate"], cfg["framerate"] or "25")
     ch = str(cfg.get("audio_channels") or "2")
+    ch = ch if ch in ("1", "2") else "2"
     rate = str(cfg.get("audio_rate") or "48000")
+    rate = rate if rate.isdigit() else "48000"
     preset = PRESETS.get(cfg["preset"], PRESETS["mjpeg"])
     copy = cfg["preset"] == "copy" and record_path is not None
 
@@ -1194,17 +1285,21 @@ def run_gui(ff, cfg):
             g.pack(fill="x", pady=(8, 0))
             self.cb_adev, self.v_adev = self._combo(g, width=30, cmd=self.on_source_change)
             self._row(g, 0, "Dispositivo:", self.cb_adev)
-            self.cb_ch, self.v_ch = self._combo(g, values=["Stereo", "Mono"],
+            self.lbl_audio = tk.Label(g, text="", anchor="w", justify="left",
+                                      font=(self.font[0], 8), wraplength=330)
+            self.lbl_audio.grid(row=1, column=1, sticky="w")
+            self.cb_ch, self.v_ch = self._combo(g, values=["Automatico", "Stereo", "Mono"],
                                                 cmd=self.on_source_change)
-            self._row(g, 1, "Canali:", self.cb_ch)
-            self.cb_rate, _ = self._combo(g, "audio_rate", ["48000", "44100", "32000"],
+            self._row(g, 2, "Canali:", self.cb_ch)
+            self.cb_rate, _ = self._combo(g, "audio_rate",
+                                          ["Automatico", "48000", "44100", "32000"],
                                           cmd=self.on_source_change)
-            self._row(g, 2, "Frequenza (Hz):", self.cb_rate)
+            self._row(g, 3, "Frequenza (Hz):", self.cb_rate)
             self.vars["audio_monitor"] = tk.BooleanVar()
             self.chk_mon = tk.Checkbutton(g, text="Ascolta l'audio dagli altoparlanti",
                                           variable=self.vars["audio_monitor"],
                                           command=self.on_source_change)
-            self.chk_mon.grid(row=3, column=0, columnspan=2, sticky="w")
+            self.chk_mon.grid(row=4, column=0, columnspan=2, sticky="w")
 
             self.lock_widgets += [self.cb_vdev, self.cb_input, self.cb_std, self.cb_fmt,
                                   self.cb_size, self.cb_fps, self.cb_adev, self.cb_ch,
@@ -1286,6 +1381,8 @@ def run_gui(ff, cfg):
             self.nb.add(tab, text="Regolazioni")
             self.adj_frame = self._groupbox(tab, "Immagine (applicate in tempo reale)")
             self.adj_frame.pack(fill="both", expand=True)
+            self.adj_audio = self._groupbox(tab, "Volume di registrazione della scheda")
+            self.adj_audio.pack(fill="x", pady=(6, 0))
             row = tk.Frame(tab, pady=6)
             row.pack(fill="x")
             self._button(row, "Valori predefiniti", self.reset_controls).pack(side="left")
@@ -1406,7 +1503,7 @@ def run_gui(ff, cfg):
             self.audio_devices = list_audio_devices(ff)
             self.cb_adev.configure(values=[a[1] for a in self.audio_devices])
             self._load_vars()
-            self.on_video_device(initial=True, pick_audio=not self.cfg["audio_device"])
+            self.on_video_device(initial=True)
             self.status("Pronto" if n else "Nessuna scheda di acquisizione trovata: "
                                            "collegala e premi Aggiorna")
             if restart and not first:
@@ -1423,7 +1520,10 @@ def run_gui(ff, cfg):
             self.cb_split.current(list(SPLIT_VALUES.keys()).index(
                 str(c["split_minutes"]) if str(c["split_minutes"]) in SPLIT_VALUES else "0"))
             self.vars["nosignal_minutes"].set(str(c["nosignal_minutes"]))
-            self.v_ch.set("Mono" if str(c["audio_channels"]) == "1" else "Stereo")
+            self.v_ch.set({"1": "Mono", "2": "Stereo"}.get(str(c["audio_channels"]),
+                                                           "Automatico"))
+            if not str(c["audio_rate"]).isdigit():
+                self.vars["audio_rate"].set("Automatico")
             key = c["preset"] if c["preset"] in self.preset_keys else self.preset_keys[0]
             self.cb_preset.current(self.preset_keys.index(key))
             self.cb_deint.current(list(DEINTERLACE.keys()).index(
@@ -1433,10 +1533,10 @@ def run_gui(ff, cfg):
             crf = {"18": 0, "22": 1, "26": 2}.get(str(c["conv_crf"]), 1)
             self.cb_crf.current(crf)
             vals = [a[0] for a in self.audio_devices]
-            if c["audio_device"] in vals:
-                self.cb_adev.current(vals.index(c["audio_device"]))
+            self.cb_adev.current(vals.index(c["audio_device"])
+                                 if c["audio_device"] in vals else 0)
 
-        def on_video_device(self, initial=False, pick_audio=True):
+        def on_video_device(self, initial=False):
             d = self.current_video()
             if not d:
                 return
@@ -1472,18 +1572,10 @@ def run_gui(ff, cfg):
                         break
             self.cb_fmt.current(self.fmt_keys.index(cur) if cur in self.fmt_keys else 0)
             self.on_format(restart=False)
-            # Abbina automaticamente l'audio della stessa scheda USB
-            if pick_audio and d.usb:
-                for i, a in enumerate(self.audio_devices):
-                    if a[2] and a[2] == d.usb:
-                        self.cb_adev.current(i)
-                        self.log("Audio abbinato automaticamente: " + a[1])
-                        break
             if self.cb_adev.current() < 0 and self.audio_devices:
-                self.cb_adev.current(len(self.audio_devices) - 1 if d.path != TEST_SOURCE
-                                     else len(self.audio_devices) - 2)
-            if d.path == TEST_SOURCE and pick_audio and not initial:
-                self.cb_adev.current(len(self.audio_devices) - 2)
+                self.cb_adev.current(0)   # audio della scheda di acquisizione
+            self.save_vars()
+            self.update_audio_info(log=True)
             self.build_controls()
             if not initial:
                 self.on_source_change()
@@ -1539,6 +1631,8 @@ def run_gui(ff, cfg):
 
         def on_source_change(self):
             self.save_vars()
+            self.update_audio_info()
+            self.build_audio_controls()
             if self.mode == "preview":
                 self.schedule_restart()
 
@@ -1574,7 +1668,9 @@ def run_gui(ff, cfg):
             idx = self.cb_adev.current()
             if 0 <= idx < len(self.audio_devices):
                 c["audio_device"] = self.audio_devices[idx][0]
-            c["audio_channels"] = "1" if self.v_ch.get() == "Mono" else "2"
+            c["audio_channels"] = {"Mono": "1", "Stereo": "2"}.get(self.v_ch.get(), "auto")
+            if not str(c["audio_rate"]).isdigit():
+                c["audio_rate"] = "auto"
             idx = self.cb_preset.current()
             if 0 <= idx < len(self.preset_keys):
                 c["preset"] = self.preset_keys[idx]
@@ -1584,7 +1680,37 @@ def run_gui(ff, cfg):
             save_config(c)
 
         # ---------------------------------------------------------- regolazioni
+        def build_audio_controls(self):
+            for w in self.adj_audio.winfo_children():
+                w.destroy()
+            _, _, _, entry, _ = self.resolve_audio()
+            if not entry or not entry[3]:
+                tk.Label(self.adj_audio, text="Nessuna scheda audio ALSA selezionata.").grid(
+                    row=0, column=0, sticky="w")
+                return
+            if not shutil.which("amixer"):
+                tk.Label(self.adj_audio, text="Installa alsa-utils per regolare il volume.").grid(
+                    row=0, column=0, sticky="w")
+                return
+            card = entry[3]["id"]
+            ctrls = [c for c in alsa_capture_controls(card) if c[1] is not None]
+            if not ctrls:
+                tk.Label(self.adj_audio, text="La scheda non ha un volume di registrazione "
+                                              "regolabile.").grid(row=0, column=0, sticky="w")
+                return
+            for r, (name, pct, _, _) in enumerate(ctrls[:4]):
+                tk.Label(self.adj_audio, text=name + ":", anchor="w").grid(
+                    row=r, column=0, sticky="w")
+                v = tk.IntVar(value=pct)
+                tk.Scale(self.adj_audio, from_=0, to=100, orient="horizontal", variable=v,
+                         length=230, sliderrelief="raised", bd=1, troughcolor="#bfbbb3",
+                         sliderlength=18, width=12,
+                         command=lambda val, n=name: alsa_set_capture(
+                             card, n, int(float(val)))).grid(row=r, column=1, sticky="we")
+            self.adj_audio.columnconfigure(1, weight=1)
+
         def build_controls(self):
+            self.build_audio_controls()
             for w in self.adj_frame.winfo_children():
                 w.destroy()
             self.ctrl_vars = {}
@@ -1662,6 +1788,66 @@ def run_gui(ff, cfg):
                 run_cmd(["v4l2-ctl", "-d", d.path, "-c",
                          ",".join("%s=%d" % kv for kv in saved.items())])
 
+        # ---------------------------------------------------------- audio
+        def resolve_audio(self):
+            """Audio effettivo da usare: (valore, canali, frequenza, voce, formato nativo)."""
+            sel = self.cfg["audio_device"] or CARD_AUDIO
+            d = self.current_video()
+            entry = None
+            if sel == CARD_AUDIO:
+                if d is not None and d.path == TEST_SOURCE:
+                    value = TEST_SOURCE
+                else:
+                    entry = find_card_audio(self.audio_devices, d)
+                    value = entry[0] if entry else NO_AUDIO
+            else:
+                value = sel
+                for a in self.audio_devices:
+                    if a[0] == sel:
+                        entry = a
+            native = alsa_native_format(entry[3]["num"]) if entry and entry[3] else None
+            ch = str(self.cfg["audio_channels"])
+            if ch not in ("1", "2"):
+                ch = ("1" if native[0] == 1 else "2") if native else "2"
+            rate = str(self.cfg["audio_rate"])
+            if not rate.isdigit():
+                rate = str(native[1]) if native else "48000"
+            return value, ch, rate, entry, native
+
+        def update_audio_info(self, log=False):
+            value, ch, rate, entry, native = self.resolve_audio()
+            auto = (self.cfg["audio_device"] or CARD_AUDIO) == CARD_AUDIO
+            if value == NO_AUDIO and auto:
+                txt = ("\u26a0 Audio della scheda non trovato: controlla il cavo USB e "
+                       "premi Aggiorna, oppure scegli il dispositivo a mano.")
+                self.lbl_audio.configure(text=txt, fg="#c00000")
+                if log:
+                    self.log("ATTENZIONE: audio della scheda di acquisizione non trovato.")
+                return
+            name = entry[1] if entry else {TEST_SOURCE: "tono di prova",
+                                           NO_AUDIO: "nessun audio"}.get(value, value)
+            txt = ("\u2192 " if auto else "") + name
+            if value != NO_AUDIO:
+                txt += "\n%s, %s Hz" % ("mono" if ch == "1" else "stereo", rate)
+                if native:
+                    txt += "  (formato nativo della scheda: %d canali, %d Hz)" % native
+            self.lbl_audio.configure(text=txt, fg="#000080")
+            if log and auto and entry:
+                self.log("Audio della scheda di acquisizione: %s" % entry[1])
+
+        def prepare_card_audio(self, entry):
+            """Attiva l'ingresso di registrazione del mixer della scheda (alcune schede
+            partono con la cattura disattivata e registrano silenzio)."""
+            if not entry or not entry[3]:
+                return
+            for name, pct, has_sw, on in alsa_capture_controls(entry[3]["id"]):
+                if has_sw and not on:
+                    if alsa_set_capture(entry[3]["id"], name):
+                        self.log("Attivato l'ingresso audio '%s' della scheda." % name)
+                if pct == 0:
+                    self.log("Attenzione: il volume di registrazione '%s' è a 0%%: "
+                             "alzalo nella scheda Regolazioni." % name)
+
         # ---------------------------------------------------------- motore
         def launch(self, record_path=None, seg=0, quiet=False):
             d = self.current_video()
@@ -1670,6 +1856,9 @@ def run_gui(ff, cfg):
                 return False
             self.save_vars()
             self.apply_device_setup(d)
+            avalue, ach, arate, aentry, _ = self.resolve_audio()
+            self.prepare_card_audio(aentry)
+            eff = dict(self.cfg, audio_device=avalue, audio_channels=ach, audio_rate=arate)
             eng = CaptureEngine()
             pfps = 12
             if record_path and not self.cfg["preview_while_recording"]:
@@ -1679,12 +1868,10 @@ def run_gui(ff, cfg):
                 title = os.path.splitext(os.path.basename(self.rec["base"]))[0]
             try:
                 eng.start(lambda fd, mfd: build_ffmpeg_cmd(
-                    ff, self.cfg, record_path, fd, pfps,
+                    ff, eff, record_path, fd, pfps,
                     use_v4l2ctl=self.use_v4l2ctl and d.path != TEST_SOURCE, title=title,
                     segment_seconds=seg, monitor_fd=mfd),
-                    self.cfg["audio_channels"],
-                    monitor=bool(self.cfg["audio_monitor"]) and
-                    self.cfg["audio_device"] != NO_AUDIO)
+                    ach, monitor=bool(self.cfg["audio_monitor"]) and avalue != NO_AUDIO)
             except RuntimeError as e:
                 self.log(str(e))
                 if not quiet:
@@ -1759,6 +1946,13 @@ def run_gui(ff, cfg):
                     APP_NAME, "La 'Copia diretta' funziona solo con formato pixel MJPEG o "
                               "H.264.\nScegli il formato nella scheda Sorgente o cambia codifica.")
                 return
+            if self.resolve_audio()[0] == NO_AUDIO and self.cfg["audio_device"] != NO_AUDIO:
+                if not messagebox.askyesno(
+                        APP_NAME, "L'audio della scheda di acquisizione non è stato trovato.\n\n"
+                                  "Controlla il collegamento USB e premi 'Aggiorna' nella "
+                                  "scheda Sorgente.\n\nRegistrare comunque SENZA audio?",
+                        icon="warning"):
+                    return
             seg = int(self.cfg["split_minutes"] or 0) * 60
             fst = filesystem_type(outdir)
             if fst in ("vfat", "msdos", "fat") and not seg:
@@ -2374,16 +2568,23 @@ fino all'ultimo secondo registrato."""
 
 def cli_list(ff):
     print("ffmpeg: %s" % ff.version_str)
+    videos = list_video_devices(ff)
     print("\nDispositivi video:")
-    for d in list_video_devices(ff):
+    for d in videos:
         print("  %s  %s" % (d.path, d.name))
         for k, (desc, sizes) in d.formats.items():
             print("      formato %-10s %-22s %s" % (k, desc, " ".join(sizes[:8])))
         for i, n in d.inputs:
             print("      ingresso %d: %s" % (i, n))
     print("\nDispositivi audio:")
-    for value, label, _ in list_audio_devices(ff):
+    audios = list_audio_devices(ff)
+    for value, label, _, _ in audios:
         print("  %-45s %s" % (value, label))
+    print("\nAudio della scheda di acquisizione:")
+    for d in videos:
+        if d.formats:
+            a = find_card_audio(audios, d)
+            print("  %s -> %s" % (d.path, a[1] if a else "non trovato"))
 
 
 def main():
