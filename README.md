@@ -122,6 +122,10 @@ Se non hai ancora la scheda puoi provare tutto con "Segnale di prova".
 | Nessun audio | Controlla che i cavi audio (bianco/rosso) vadano nella scheda USB. In *Sorgente* sotto "Audio" deve comparire il nome della scheda; poi alza il volume in *Regolazioni*. Con `python3 acquisitore.py --elenco` vedi quale audio è abbinato. |
 | Audio distorto (CLIP) | Abbassa il volume dell'uscita del videoregistratore, se possibile, o il controllo "Volume audio" in *Regolazioni*. |
 
+| Ogni tanto l'immagine diventa nera per un attimo | È la scheda di acquisizione che perde l'aggancio al segnale della cassetta (succede spesso con le schede economiche tipo MS2109/MS210x e con nastri o videoregistratori un po' instabili). Il registro e la barra di stato indicano quante volte succede ("buchi"). Pulisci le testine e regola il tracking; se possibile usa un videoregistratore con TBC/correzione del segnale o fai passare il segnale da un registratore DVD. Nella conversione i buchi vengono nascosti ripetendo l'ultima immagine buona. |
+| Il video "scatta" | Alcune schede inviano 30 fotogrammi/s anche con le cassette PAL (25): il programma lo rileva e toglie i fotogrammi duplicati, sia in registrazione sia in conversione. |
+| Il VU-meter è sempre alto anche col volume basso | Alcune schede aggiungono una componente continua all'audio: viene rimossa automaticamente. |
+
 I messaggi completi di ffmpeg sono nella scheda **Registro**.
 
 ## File

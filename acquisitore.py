@@ -78,6 +78,8 @@ DEFAULTS = {
     "conv_crf": "22",
     "conv_speed": "veryfast",
     "conv_deinterlace": True,
+    "conv_fix_dropouts": True,
+    "conv_normalize": True,
     "split_minutes": "0",
     "auto_recover": True,
 }
@@ -246,6 +248,7 @@ class FFmpegInfo(object):
         self.encoders = set()
         self.demuxers = set()
         self.muxers = set()
+        self.filters = set()
         if not self.path:
             return
         _, out = run_cmd([self.path, "-hide_banner", "-version"])
@@ -258,6 +261,11 @@ class FFmpegInfo(object):
             m = re.match(r"^\s*[VAS][\w.]{5}\s+(\S+)", line)
             if m:
                 self.encoders.add(m.group(1))
+        _, out = run_cmd([self.path, "-hide_banner", "-filters"])
+        for line in out.splitlines():
+            m = re.match(r"^\s*[TSC.]{2,3}\s+(\w+)\s", line)
+            if m:
+                self.filters.add(m.group(1))
         _, out = run_cmd([self.path, "-hide_banner", "-devices"])
         for line in out.splitlines():
             m = re.match(r"^\s*([D ])([E ])\s+(\S+)", line)
@@ -525,6 +533,80 @@ def alsa_set_capture(card_id, name, percent=None):
 # Costruzione del comando ffmpeg
 # --------------------------------------------------------------------------
 
+PAL_STANDARDS = ("PAL", "SECAM", "PAL-Nc")
+NTSC_STANDARDS = ("NTSC", "PAL-M", "NTSC-JP")
+
+
+def fps_float(value):
+    try:
+        if "/" in str(value):
+            a, b = str(value).split("/")
+            return float(a) / float(b)
+        return float(value)
+    except (ValueError, ZeroDivisionError):
+        return 0.0
+
+
+def target_fps(cfg):
+    """Frame rate del file registrato: quello vero della videocassetta."""
+    std = cfg.get("standard")
+    if std in PAL_STANDARDS:
+        return "25"
+    if std in NTSC_STANDARDS:
+        return "30000/1001"
+    return FPS_VALUES.get(cfg.get("framerate"), cfg.get("framerate") or "25")
+
+
+def needs_decimate(source_fps, target):
+    """Le schede tipo MS2109 inviano 30 fps anche con un segnale PAL a 25:
+    un fotogramma su sei è un duplicato che fa 'scattare' il video."""
+    return abs(source_fps - 30.0) < 0.6 and abs(fps_float(target) - 25.0) < 0.1
+
+
+def probe_device_fps(ff, cfg):
+    """Frame rate che la scheda usa davvero con le impostazioni scelte."""
+    fps = FPS_VALUES.get(cfg["framerate"], cfg["framerate"] or "25")
+    args = [ff.path, "-hide_banner", "-f", "v4l2"]
+    if cfg.get("input_format"):
+        args += ["-input_format", cfg["input_format"]]
+    args += ["-video_size", cfg["video_size"] or "720x576", "-framerate", fps,
+             "-i", cfg["video_device"], "-frames:v", "1", "-f", "null", "-"]
+    _, out = run_cmd(args, timeout=10)
+    m = re.search(r"changed the time per frame from \d+/\d+ to (\d+)/(\d+)", out)
+    if m and int(m.group(1)):
+        return int(m.group(2)) / float(m.group(1))
+    m = re.search(r"Stream #0:0.*?Video:.*?([\d.]+) fps", out)
+    if m:
+        return float(m.group(1))
+    return None
+
+
+def conversion_filters(ff, cfg, source_fps):
+    """Filtri video/audio per creare la copia MP4 'riparata'."""
+    vf = []
+    out_fps = source_fps
+    tgt = target_fps(cfg)
+    if source_fps and needs_decimate(source_fps, tgt) and "decimate" in ff.filters:
+        vf.append("decimate=cycle=6")          # 30 fps con duplicati -> 25 fps veri
+        out_fps = 25.0
+    if cfg.get("conv_fix_dropouts") and "signalstats" in ff.filters and out_fps:
+        # Le schede economiche, quando perdono l'aggancio al segnale della cassetta,
+        # inviano fotogrammi neri (luminosità esattamente 0, anche solo in parte).
+        # Si scartano e il filtro fps ripete l'ultimo fotogramma buono: la durata
+        # e la sincronia con l'audio restano identiche.
+        vf.append("signalstats,metadata=mode=select:key=lavfi.signalstats.YLOW:"
+                  "value=2:function=greater")
+        vf.append("fps=%s:start_time=0" % ("25" if out_fps == 25.0 else
+                                           "%.5f" % out_fps))
+    if cfg.get("conv_deinterlace"):
+        vf.append("yadif=0:-1:0")
+    vf.append("format=yuv420p")
+    af = ["highpass=f=10"]                     # toglie la componente continua (DC)
+    if cfg.get("conv_normalize") and "loudnorm" in ff.filters:
+        af.append("loudnorm=I=-18:TP=-2:LRA=11")
+    return vf, af
+
+
 def preview_dims(cfg):
     w = PREVIEW_SIZES.get(cfg.get("preview_size"), 384)
     h = w * 9 // 16 if cfg.get("aspect") == "16:9" else w * 3 // 4
@@ -590,6 +672,9 @@ def build_ffmpeg_cmd(ff, cfg, record_path=None, meter_fd=None, preview_fps=12,
             vrec_map = "0:v"
         else:
             rec_filters = []
+            if cfg.get("_device_fps") and needs_decimate(cfg["_device_fps"], target_fps(cfg)) \
+                    and "decimate" in ff.filters:
+                rec_filters.append("decimate=cycle=6")
             if cfg.get("deinterlace") in ("yadif", "bwdif"):
                 rec_filters.append("%s=0:-1:0" % cfg["deinterlace"])
             if cfg.get("head_mask"):
@@ -613,9 +698,10 @@ def build_ffmpeg_cmd(ff, cfg, record_path=None, meter_fd=None, preview_fps=12,
         if a_outs:
             labels = "".join("[%s]" % o for o in a_outs)
             if len(a_outs) == 1:
-                graph.append("[1:a]aresample=async=1000%s" % labels)
+                graph.append("[1:a]highpass=f=10,aresample=async=1000%s" % labels)
             else:
-                graph.append("[1:a]aresample=async=1000,asplit=%d%s" % (len(a_outs), labels))
+                graph.append("[1:a]highpass=f=10,aresample=async=1000,asplit=%d%s"
+                             % (len(a_outs), labels))
         if "amet" in a_outs:
             layout = "mono" if ch == "1" else "stereo"
             graph.append("[amet]aresample=8000,aformat=sample_fmts=s16:channel_layouts=%s[ameter]"
@@ -630,7 +716,7 @@ def build_ffmpeg_cmd(ff, cfg, record_path=None, meter_fd=None, preview_fps=12,
             cmd += ["-map", "[arec]"]
         cmd += preset[1]
         if not copy:
-            cmd += ["-r", fps]
+            cmd += ["-r", target_fps(cfg) if vdev != TEST_SOURCE else fps]
             if ff.version >= (5, 1):
                 cmd += ff.fps_mode_args()
             cmd += ["-aspect", cfg.get("aspect") or "4:3"]
@@ -1010,6 +1096,8 @@ def run_gui(ff, cfg):
             self.last_duration = None
             self.recover_job = None
             self.inhibitor = SleepInhibitor()
+            self.fps_cache = {}
+            self.dropout_start = None
             self.chapters = []
             self.signal_seen_since = None
             self.signal_ok_time = 0.0
@@ -1462,6 +1550,14 @@ def run_gui(ff, cfg):
             tk.Checkbutton(g2, text="Deinterlaccia (consigliato)",
                            variable=self.vars["conv_deinterlace"]).grid(
                 row=2, column=0, columnspan=2, sticky="w")
+            self.vars["conv_fix_dropouts"] = tk.BooleanVar()
+            tk.Checkbutton(g2, text="Nascondi i buchi neri (perdita di segnale della scheda)",
+                           variable=self.vars["conv_fix_dropouts"]).grid(
+                row=3, column=0, columnspan=2, sticky="w")
+            self.vars["conv_normalize"] = tk.BooleanVar()
+            tk.Checkbutton(g2, text="Normalizza il volume dell'audio",
+                           variable=self.vars["conv_normalize"]).grid(
+                row=4, column=0, columnspan=2, sticky="w")
 
             row = tk.Frame(tab, pady=6)
             row.pack(fill="x")
@@ -1567,7 +1663,8 @@ def run_gui(ff, cfg):
                       "aspect", "conv_speed"):
                 self.vars[k].set(str(c[k]))
             for k in ("audio_monitor", "head_mask", "auto_stop_nosignal",
-                      "preview_while_recording", "conv_deinterlace", "auto_recover"):
+                      "preview_while_recording", "conv_deinterlace", "auto_recover",
+                      "conv_fix_dropouts", "conv_normalize"):
                 self.vars[k].set(bool(c[k]))
             self.cb_split.current(list(SPLIT_VALUES.keys()).index(
                 str(c["split_minutes"]) if str(c["split_minutes"]) in SPLIT_VALUES else "0"))
@@ -1722,7 +1819,8 @@ def run_gui(ff, cfg):
                       "nosignal_minutes", "conv_speed"):
                 c[k] = self.vars[k].get()
             for k in ("audio_monitor", "head_mask", "auto_stop_nosignal",
-                      "preview_while_recording", "conv_deinterlace", "auto_recover"):
+                      "preview_while_recording", "conv_deinterlace", "auto_recover",
+                      "conv_fix_dropouts", "conv_normalize"):
                 c[k] = bool(self.vars[k].get())
             c["split_minutes"] = list(SPLIT_VALUES.keys())[max(0, self.cb_split.current())]
             idx = self.cb_fmt.current()
@@ -1925,6 +2023,20 @@ def run_gui(ff, cfg):
             avalue, ach, arate, aentry, _ = self.resolve_audio()
             self.prepare_card_audio(aentry)
             eff = dict(self.cfg, audio_device=avalue, audio_channels=ach, audio_rate=arate)
+            if record_path and d.path != TEST_SOURCE:
+                key = (d.path, self.cfg["input_format"], self.cfg["video_size"],
+                       self.cfg["framerate"])
+                if key not in self.fps_cache:
+                    self.fps_cache[key] = probe_device_fps(ff, self.cfg)
+                    dfps = self.fps_cache[key]
+                    tgt = target_fps(self.cfg)
+                    if dfps:
+                        self.log("La scheda invia %.2f fotogrammi/s (il file sarà a %.2f)."
+                                 % (dfps, fps_float(tgt)))
+                    if dfps and needs_decimate(dfps, tgt):
+                        self.log("Segnale PAL a 25 fps inviato a 30 fps dalla scheda: i "
+                                 "fotogrammi duplicati verranno rimossi (niente scatti).")
+                eff["_device_fps"] = self.fps_cache[key]
             eng = CaptureEngine()
             pfps = 12
             if record_path and not self.cfg["preview_while_recording"]:
@@ -2134,6 +2246,10 @@ def run_gui(ff, cfg):
             if r["recoveries"]:
                 self.log("La registrazione è stata ripresa automaticamente %d volte."
                          % r["recoveries"])
+            if r.get("dropouts"):
+                self.log("La scheda ha perso il segnale %d volte (immagine nera). Pulisci le "
+                         "testine e regola il tracking; nella conversione i buchi vengono "
+                         "nascosti." % r["dropouts"])
             if self.chapters:
                 self._write_chapters(r["base"] + r["ext"])
             self.status("Salvato: %s  (%s, %s)" % (os.path.basename(r["base"] + r["ext"]),
@@ -2238,6 +2354,14 @@ def run_gui(ff, cfg):
                         if self.nosignal_since is None:
                             self.nosignal_since = now
                     else:
+                        r = self.rec
+                        if self.nosignal_since is not None and self.signal_ok_time and \
+                                self.mode == "recording" and r and r["start"] is not None:
+                            dur = now - self.nosignal_since
+                            if dur < 120:
+                                r["dropouts"] = r.get("dropouts", 0) + 1
+                                self.log("Perdita di segnale della scheda a %s (%.1f s)" % (
+                                    fmt_hms(self.nosignal_since - r["start"]), dur))
                         self.nosignal_since = None
                         self.signal_ok_time = self.signal_ok_time or now
                     self.nosignal = uniform and now - (self.nosignal_since or now) > 1.0
@@ -2352,8 +2476,9 @@ def run_gui(ff, cfg):
                     drop += int(p.get("drop_frames", "0") or 0)
                     dup += int(p.get("dup_frames", "0") or 0)
                     fps = p.get("fps", "-")
-                self.st_fps.configure(text="fps %s  persi %d  dupl. %d" % (fps, drop, dup),
-                                      fg="#c00000" if drop > 25 else "black")
+                buchi = r.get("dropouts", 0)
+                self.st_fps.configure(text="fps %s  persi %d  buchi %d" % (fps, drop, buchi),
+                                      fg="#c00000" if drop > 25 or buchi else "black")
                 size = getattr(self, "rec_size", 0)
                 if free is not None and el > 10 and size > 0:
                     self.st_disk.configure(text="Libero %s (~%s)" % (
@@ -2452,13 +2577,13 @@ def run_gui(ff, cfg):
                 dst = os.path.splitext(src)[0] + "_convertito_%d.mp4" % n
                 n += 1
             self.conv_duration = self._probe_duration(src)
-            vf = ["yadif=0:-1:0"] if self.cfg["conv_deinterlace"] else []
-            vf.append("format=yuv420p")
+            vf, af = conversion_filters(ff, self.cfg, self._probe_fps(src))
             cmd = ([shutil.which("nice"), "-n", "15"] if shutil.which("nice") else []) + [
                 ff.path, "-hide_banner", "-nostdin", "-loglevel", "error", "-nostats",
                 "-progress", "pipe:1", "-i", src, "-map", "0:v:0", "-map", "0:a?",
                 "-vf", ",".join(vf), "-c:v", "libx264", "-preset", self.cfg["conv_speed"],
-                "-crf", str(self.cfg["conv_crf"]), "-c:a", "aac", "-b:a", "160k",
+                "-crf", str(self.cfg["conv_crf"]), "-af", ",".join(af), "-ar", "48000",
+                "-c:a", "aac", "-b:a", "160k",
                 "-movflags", "+faststart", dst]
             self.log("Conversione: " + " ".join(shlex.quote(c) for c in cmd))
             try:
@@ -2487,6 +2612,14 @@ def run_gui(ff, cfg):
                 t.daemon = True
                 t.start()
             self.conv_lbl.configure(text="Conversione di " + os.path.basename(src))
+
+        def _probe_fps(self, path):
+            if not ff.ffprobe:
+                return 0.0
+            _, out = run_cmd([ff.ffprobe, "-v", "error", "-select_streams", "v:0",
+                              "-show_entries", "stream=r_frame_rate", "-of",
+                              "default=nw=1:nk=1", path])
+            return fps_float(out.strip().splitlines()[0]) if out.strip() else 0.0
 
         def _probe_duration(self, path):
             if ff.ffprobe:
