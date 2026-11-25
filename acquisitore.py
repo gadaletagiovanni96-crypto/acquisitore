@@ -77,6 +77,7 @@ DEFAULTS = {
     "controls": {},
     "conv_crf": "22",
     "conv_speed": "veryfast",
+    "conv_encoder": "auto",
     "conv_deinterlace": True,
     "conv_fix_dropouts": True,
     "conv_normalize": True,
@@ -102,6 +103,9 @@ PRESETS = collections.OrderedDict([
     ("mjpeg", ("MJPEG alta qualità - poca CPU, file grandi (consigliato)",
                ["-c:v", "mjpeg", "-q:v", "3", "-pix_fmt", "yuvj422p"],
                ["-c:a", "pcm_s16le"], "mjpeg")),
+    ("vaapi", ("H.264 con la scheda grafica Intel - poca CPU, file piccoli",
+               ["-c:v", "h264_vaapi", "-qp", "22"],
+               ["-c:a", "aac", "-b:a", "192k"], "h264_vaapi")),
     ("x264fast", ("H.264 veloce - CPU media, file medi",
                   ["-c:v", "libx264", "-preset", "ultrafast", "-crf", "20",
                    "-pix_fmt", "yuv420p"],
@@ -249,6 +253,8 @@ class FFmpegInfo(object):
         self.demuxers = set()
         self.muxers = set()
         self.filters = set()
+        self.vaapi_device = None
+        self.vaapi_deint = False
         if not self.path:
             return
         _, out = run_cmd([self.path, "-hide_banner", "-version"])
@@ -275,6 +281,33 @@ class FFmpegInfo(object):
                         self.demuxers.add(name)
                     if m.group(2) == "E":
                         self.muxers.add(name)
+
+    def probe_vaapi(self):
+        """Verifica che la codifica H.264 hardware (Intel Quick Sync via VA-API)
+        funzioni davvero: sui Celeron/Pentium (es. Lenovo B50-30) è molto più
+        veloce del processore."""
+        self.vaapi_device = None
+        if not self.path or "h264_vaapi" not in self.encoders:
+            return None
+        for dev in sorted(glob.glob("/dev/dri/renderD*")):
+            rc, _ = run_cmd([self.path, "-hide_banner", "-v", "error", "-vaapi_device", dev,
+                             "-f", "lavfi", "-i", "testsrc2=size=720x576:rate=25",
+                             "-filter_complex", "[0:v]format=nv12,hwupload[v]", "-map", "[v]",
+                             "-frames:v", "10", "-c:v", "h264_vaapi", "-qp", "24",
+                             "-f", "null", "-"], timeout=20)
+            if rc == 0:
+                self.vaapi_device = dev
+                break
+        self.vaapi_deint = False
+        if self.vaapi_device and "deinterlace_vaapi" in self.filters:
+            rc, _ = run_cmd([self.path, "-hide_banner", "-v", "error", "-vaapi_device",
+                             self.vaapi_device, "-f", "lavfi", "-i",
+                             "testsrc2=size=720x576:rate=25", "-vf",
+                             "format=nv12,hwupload,deinterlace_vaapi=rate=frame",
+                             "-frames:v", "10", "-c:v", "h264_vaapi", "-qp", "24",
+                             "-f", "null", "-"], timeout=20)
+            self.vaapi_deint = rc == 0
+        return self.vaapi_device
 
     def fps_mode_args(self):
         if self.version >= (5, 1):
@@ -589,13 +622,14 @@ def conversion_filters(ff, cfg, source_fps):
     if source_fps and needs_decimate(source_fps, tgt) and "decimate" in ff.filters:
         vf.append("decimate=cycle=6")          # 30 fps con duplicati -> 25 fps veri
         out_fps = 25.0
-    if cfg.get("conv_fix_dropouts") and "signalstats" in ff.filters and out_fps:
+    if cfg.get("conv_fix_dropouts") and "blackframe" in ff.filters and out_fps:
         # Le schede economiche, quando perdono l'aggancio al segnale della cassetta,
         # inviano fotogrammi neri (luminosità esattamente 0, anche solo in parte).
         # Si scartano e il filtro fps ripete l'ultimo fotogramma buono: la durata
         # e la sincronia con l'audio restano identiche.
-        vf.append("signalstats,metadata=mode=select:key=lavfi.signalstats.YLOW:"
-                  "value=2:function=greater")
+        # blackframe costa meno della metà di signalstats.
+        vf.append("format=yuv422p|yuv420p,blackframe=amount=0:threshold=20,"
+                  "metadata=mode=select:key=lavfi.blackframe.pblack:value=5:function=less")
         vf.append("fps=%s:start_time=0" % ("25" if out_fps == 25.0 else
                                            "%.5f" % out_fps))
     if cfg.get("conv_deinterlace"):
@@ -605,6 +639,48 @@ def conversion_filters(ff, cfg, source_fps):
     if cfg.get("conv_normalize") and "loudnorm" in ff.filters:
         af.append("loudnorm=I=-18:TP=-2:LRA=11")
     return vf, af
+
+
+def conversion_command(ff, cfg, src, dst, source_fps, hw=False, light=False):
+    """Comando di conversione in MP4.
+
+    hw:    codifica H.264 con la grafica Intel (VA-API), quasi senza CPU.
+    light: un solo thread, per lasciare il processore alla registrazione.
+    Sempre a priorità minima (nice/ionice) per non disturbare il resto.
+    """
+    vf, af = conversion_filters(ff, cfg, source_fps)
+    cmd = []
+    if shutil.which("nice"):
+        cmd += [shutil.which("nice"), "-n", "19"]
+    if shutil.which("ionice"):
+        cmd += [shutil.which("ionice"), "-c", "2", "-n", "7"]
+    cmd += [ff.path, "-hide_banner", "-nostdin", "-y", "-loglevel", "error", "-nostats",
+            "-progress", "pipe:1"]
+    if hw:
+        cmd += ["-vaapi_device", ff.vaapi_device]
+    if light:
+        cmd += ["-threads", "1"]
+    cmd += ["-i", src, "-map", "0:v:0", "-map", "0:a?"]
+    if hw:
+        # Il deinterlacciamento, se possibile, lo fa anche lui la grafica Intel
+        gpu_deint = ff.vaapi_deint and "yadif=0:-1:0" in vf
+        if gpu_deint:
+            vf.remove("yadif=0:-1:0")
+        vf = vf[:-1] + ["format=nv12", "hwupload"]
+        if gpu_deint:
+            vf.append("deinterlace_vaapi=rate=frame")
+        qp = {"18": "20", "22": "24", "26": "28"}.get(str(cfg.get("conv_crf")), "24")
+        cmd += ["-vf", ",".join(vf), "-c:v", "h264_vaapi", "-qp", qp]
+    else:
+        cmd += ["-vf", ",".join(vf), "-c:v", "libx264", "-preset",
+                cfg.get("conv_speed") or "veryfast", "-crf", str(cfg.get("conv_crf") or 22)]
+        if light:
+            cmd += ["-threads", "1"]
+    if light:
+        cmd += ["-filter_threads", "1"] if ff.version >= (4, 0) else []
+    cmd += ["-af", ",".join(af), "-ar", "48000", "-c:a", "aac", "-b:a", "160k",
+            "-movflags", "+faststart", dst]
+    return cmd
 
 
 def preview_dims(cfg):
@@ -630,6 +706,9 @@ def build_ffmpeg_cmd(ff, cfg, record_path=None, meter_fd=None, preview_fps=12,
 
     cmd = [ff.path, "-hide_banner", "-nostdin", "-y", "-loglevel", "warning",
            "-nostats", "-progress", "pipe:2"]
+    hw_rec = record_path and cfg["preset"] == "vaapi" and ff.vaapi_device
+    if hw_rec:
+        cmd += ["-vaapi_device", ff.vaapi_device]
     if record_path and ff.version < (5, 1):
         cmd += ff.fps_mode_args()
 
@@ -680,6 +759,8 @@ def build_ffmpeg_cmd(ff, cfg, record_path=None, meter_fd=None, preview_fps=12,
             if cfg.get("head_mask"):
                 # Copre con una banda nera il rumore delle testine in fondo al quadro
                 rec_filters.append("crop=iw:ih-12:0:0,pad=iw:ih+12:0:0:black")
+            if hw_rec:
+                rec_filters.append("format=nv12,hwupload")   # codifica sulla GPU Intel
             graph.append("[0:v]split=2[vr0][vp0]")
             graph.append("[vr0]%s[vrec]" % (",".join(rec_filters) or "null"))
             prev_in = "[vp0]"
@@ -1097,6 +1178,12 @@ def run_gui(ff, cfg):
             self.recover_job = None
             self.inhibitor = SleepInhibitor()
             self.fps_cache = {}
+            self.conv_paused = False
+            self.conv_pause_until = 0
+            self.conv_hw = False
+            self.conv_started = 0
+            self.conv_force_cpu = set()
+            self.drop_hist = collections.deque(maxlen=12)   # ~6 s di storia
             self.dropout_start = None
             self.chapters = []
             self.signal_seen_since = None
@@ -1462,7 +1549,8 @@ def run_gui(ff, cfg):
             g = self._groupbox(tab, "Qualità")
             g.pack(fill="x", pady=(8, 0))
             self.preset_keys = [k for k, p in PRESETS.items()
-                                if p[3] is None or p[3] in ff.encoders]
+                                if (p[3] is None or p[3] in ff.encoders) and
+                                (k != "vaapi" or ff.vaapi_device)]
             self.cb_preset, self.v_preset = self._combo(
                 g, values=[PRESETS[k][0] for k in self.preset_keys], width=30,
                 cmd=self.save_vars)
@@ -1544,8 +1632,9 @@ def run_gui(ff, cfg):
                 g2, values=["18 - alta", "22 - media", "26 - bassa"], width=20)
             self._row(g2, 0, "Qualità:", self.cb_crf)
             self.cb_speed, _ = self._combo(g2, "conv_speed",
-                                           ["ultrafast", "veryfast", "medium", "slow"], width=20)
-            self._row(g2, 1, "Velocità:", self.cb_speed)
+                                           ["ultrafast", "superfast", "veryfast", "faster",
+                                            "medium"], width=20)
+            self._row(g2, 1, "Velocità (CPU):", self.cb_speed)
             self.vars["conv_deinterlace"] = tk.BooleanVar()
             tk.Checkbutton(g2, text="Deinterlaccia (consigliato)",
                            variable=self.vars["conv_deinterlace"]).grid(
@@ -1558,6 +1647,11 @@ def run_gui(ff, cfg):
             tk.Checkbutton(g2, text="Normalizza il volume dell'audio",
                            variable=self.vars["conv_normalize"]).grid(
                 row=4, column=0, columnspan=2, sticky="w")
+            enc_vals = ["Grafica Intel integrata (veloce)", "Processore (x264)"]
+            if not ff.vaapi_device:
+                enc_vals[0] = "Grafica Intel integrata (non disponibile)"
+            self.cb_enc, self.v_enc = self._combo(g2, values=enc_vals, width=30)
+            self._row(g2, 5, "Codificatore:", self.cb_enc)
 
             row = tk.Frame(tab, pady=6)
             row.pack(fill="x")
@@ -1582,6 +1676,12 @@ def run_gui(ff, cfg):
             sb.pack(side="right", fill="y")
             self.logtext.configure(yscrollcommand=sb.set)
             self.log("%s %s - ffmpeg %s" % (APP_NAME, VERSION, ff.version_str))
+            if ff.vaapi_device:
+                self.log("Grafica Intel integrata disponibile (%s): conversioni veloci%s." % (
+                    ff.vaapi_device, ", deinterlacciamento compreso" if ff.vaapi_deint else ""))
+            else:
+                self.log("Codifica con la grafica Intel non disponibile: le conversioni useranno "
+                         "il processore (installa i driver con install.sh).")
             if not self.use_v4l2ctl:
                 self.log("Nota: v4l2-ctl non trovato (pacchetto v4l-utils): ingressi e "
                          "regolazioni immagine limitati.")
@@ -1681,6 +1781,8 @@ def run_gui(ff, cfg):
                 str(c["max_minutes"]) if str(c["max_minutes"]) in MAX_DURATIONS else "0"))
             crf = {"18": 0, "22": 1, "26": 2}.get(str(c["conv_crf"]), 1)
             self.cb_crf.current(crf)
+            self.cb_enc.current(1 if c.get("conv_encoder") == "cpu" or not ff.vaapi_device
+                                else 0)
             vals = [a[0] for a in self.audio_devices]
             self.cb_adev.current(vals.index(c["audio_device"])
                                  if c["audio_device"] in vals else 0)
@@ -1839,6 +1941,7 @@ def run_gui(ff, cfg):
             c["deinterlace"] = list(DEINTERLACE.keys())[max(0, self.cb_deint.current())]
             c["max_minutes"] = list(MAX_DURATIONS.keys())[max(0, self.cb_maxdur.current())]
             c["conv_crf"] = self.v_crf.get().split(" ")[0] or "22"
+            c["conv_encoder"] = "cpu" if self.cb_enc.current() == 1 else "auto"
             save_config(c)
 
         # ---------------------------------------------------------- regolazioni
@@ -2103,10 +2206,8 @@ def run_gui(ff, cfg):
             if self.mode in ("recording", "recovering") or (self.engine and self.engine.stopping):
                 return
             if self.conv_proc and self.conv_proc.poll() is None:
-                if not messagebox.askyesno(
-                        APP_NAME, "È in corso una conversione: su un PC lento potrebbe "
-                                  "far perdere fotogrammi.\nRegistrare comunque?"):
-                    return
+                self.log("Conversione in corso: continua a bassa priorità e si mette in pausa "
+                         "da sola se la registrazione perde fotogrammi.")
             self.save_vars()
             outdir = os.path.expanduser(self.cfg["output_dir"])
             try:
@@ -2483,6 +2584,7 @@ def run_gui(ff, cfg):
                 if free is not None and el > 10 and size > 0:
                     self.st_disk.configure(text="Libero %s (~%s)" % (
                         fmt_size(free), fmt_hms(free / (size / el))))
+                self._conv_guard(now, drop)
                 if self.mode == "recording" and eng:
                     self._watchdog(eng, now)
                     self._check_autostop(el, now, free)
@@ -2500,6 +2602,7 @@ def run_gui(ff, cfg):
                 self.st_fps.configure(text="")
                 if free is not None:
                     self.st_disk.configure(text="Spazio libero: " + fmt_size(free))
+                self._conv_guard(now, None)
             self._conv_poll()
 
         def _watchdog(self, eng, now):
@@ -2553,11 +2656,8 @@ def run_gui(ff, cfg):
         def conv_start(self):
             if self.conv_proc and self.conv_proc.poll() is None:
                 return
-            if self.mode in ("recording", "recovering"):
-                messagebox.showinfo(APP_NAME, "Attendi la fine della registrazione: "
-                                              "convertire insieme rallenta il PC.")
-                return
             self.conv_queue = list(self.conv_list.get(0, "end"))
+            self.conv_force_cpu = set()
             if not self.conv_queue:
                 messagebox.showinfo(APP_NAME, "Aggiungi almeno un file da convertire.")
                 return
@@ -2577,14 +2677,17 @@ def run_gui(ff, cfg):
                 dst = os.path.splitext(src)[0] + "_convertito_%d.mp4" % n
                 n += 1
             self.conv_duration = self._probe_duration(src)
-            vf, af = conversion_filters(ff, self.cfg, self._probe_fps(src))
-            cmd = ([shutil.which("nice"), "-n", "15"] if shutil.which("nice") else []) + [
-                ff.path, "-hide_banner", "-nostdin", "-loglevel", "error", "-nostats",
-                "-progress", "pipe:1", "-i", src, "-map", "0:v:0", "-map", "0:a?",
-                "-vf", ",".join(vf), "-c:v", "libx264", "-preset", self.cfg["conv_speed"],
-                "-crf", str(self.cfg["conv_crf"]), "-af", ",".join(af), "-ar", "48000",
-                "-c:a", "aac", "-b:a", "160k",
-                "-movflags", "+faststart", dst]
+            hw = bool(ff.vaapi_device) and self.cfg.get("conv_encoder") != "cpu" and \
+                src not in self.conv_force_cpu
+            # Durante una registrazione: un solo thread per lasciare spazio all'acquisizione
+            light = self.mode in ("recording", "recovering") and not hw
+            cmd = conversion_command(ff, self.cfg, src, dst, self._probe_fps(src),
+                                     hw=hw, light=light)
+            self.conv_hw = hw
+            self.conv_started = time.monotonic()
+            self.log("Conversione con %s%s." % (
+                "la grafica Intel integrata" if hw else "il processore",
+                " (modalità leggera: registrazione in corso)" if light else ""))
             self.log("Conversione: " + " ".join(shlex.quote(c) for c in cmd))
             try:
                 self.conv_proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL,
@@ -2640,16 +2743,34 @@ def run_gui(ff, cfg):
             if not p:
                 return
             if p.poll() is None:
-                if self.conv_duration:
+                if self.conv_paused:
+                    self.conv_lbl.configure(text="In pausa: la registrazione ha la precedenza")
+                elif self.conv_duration:
                     frac = min(1.0, self.conv_time / self.conv_duration)
                     self.conv_pb["value"] = int(frac * 1000)
-                    self.conv_lbl.configure(text="%s: %d%%  (%s / %s)  - in coda: %d" % (
-                        os.path.basename(self.conv_cur[0]), frac * 100,
-                        fmt_hms(self.conv_time), fmt_hms(self.conv_duration),
+                    el = time.monotonic() - self.conv_started
+                    speed = self.conv_time / el if el > 3 else 0
+                    eta = ("  - fine tra %s" % fmt_hms((self.conv_duration - self.conv_time)
+                                                       / speed)) if speed > 0 else ""
+                    self.conv_lbl.configure(text="%s: %d%%  velocità %.1fx%s  - in coda: %d" % (
+                        os.path.basename(self.conv_cur[0]), frac * 100, speed, eta,
                         len(self.conv_queue)))
                 return
+            self.conv_paused = False
             if p.returncode == 0:
-                self.log("Convertito: " + self.conv_cur[1])
+                el = time.monotonic() - self.conv_started
+                self.log("Convertito in %s: %s" % (fmt_hms(el), self.conv_cur[1]))
+            elif self.conv_hw and self.conv_queue is not None:
+                # La codifica hardware non ha funzionato: si riprova col processore
+                self.log("Codifica con la grafica Intel non riuscita (%s): riprovo con il "
+                         "processore." % " | ".join(self.conv_err))
+                self.conv_force_cpu.add(self.conv_cur[0])
+                self.conv_queue.insert(0, self.conv_cur[0])
+                try:
+                    if os.path.exists(self.conv_cur[1]):
+                        os.remove(self.conv_cur[1])   # file parziale
+                except OSError:
+                    pass
             else:
                 self.log("Conversione fallita (%s): %s" % (p.returncode,
                                                            " | ".join(self.conv_err)))
@@ -2660,9 +2781,45 @@ def run_gui(ff, cfg):
             if self.conv_queue is not None:
                 self._conv_next()
 
+        def _conv_signal(self, sig):
+            try:
+                os.kill(self.conv_proc.pid, sig)
+                return True
+            except (OSError, AttributeError):
+                return False
+
+        def _conv_guard(self, now, drops):
+            """Mette in pausa la conversione se la registrazione inizia a perdere
+            fotogrammi, e la riprende dopo un po' o a registrazione finita."""
+            p = self.conv_proc
+            recording = self.mode in ("recording", "recovering")
+            if drops is not None:
+                self.drop_hist.append((now, drops))
+            else:
+                self.drop_hist.clear()
+            if not p or p.poll() is not None:
+                return
+            if self.conv_paused:
+                if not recording or now >= self.conv_pause_until:
+                    if self._conv_signal(signal.SIGCONT):
+                        self.log("Conversione ripresa.")
+                    self.conv_paused = False
+                    self.drop_hist.clear()
+                return
+            if recording and len(self.drop_hist) >= 2 and \
+                    self.drop_hist[-1][1] - self.drop_hist[0][1] >= 3:
+                if self._conv_signal(signal.SIGSTOP):
+                    self.conv_paused = True
+                    self.conv_pause_until = now + 120
+                    self.log("La registrazione perdeva fotogrammi: conversione in pausa per "
+                             "2 minuti.")
+
         def conv_cancel(self):
             if self.conv_proc and self.conv_proc.poll() is None:
                 self.conv_queue = None
+                if self.conv_paused:
+                    self._conv_signal(signal.SIGCONT)
+                    self.conv_paused = False
                 self.conv_proc.terminate()
                 self.conv_lbl.configure(text="Conversione annullata.")
                 dst = self.conv_cur[1]
@@ -2718,6 +2875,8 @@ def run_gui(ff, cfg):
             self.save_vars()
             if self.conv_proc and self.conv_proc.poll() is None:
                 self.conv_queue = None
+                if self.conv_paused:
+                    self._conv_signal(signal.SIGCONT)
                 self.conv_proc.terminate()
             if self.mode == "recovering":
                 self.on_stop()
@@ -2777,6 +2936,10 @@ fino all'ultimo secondo registrato."""
 
 def cli_list(ff):
     print("ffmpeg: %s" % ff.version_str)
+    ff.probe_vaapi()
+    print("Codifica hardware Intel (VA-API): %s%s" % (
+        ff.vaapi_device or "non disponibile",
+        " + deinterlacciamento" if ff.vaapi_deint else ""))
     videos = list_video_devices(ff)
     print("\nDispositivi video:")
     for d in videos:
@@ -2823,6 +2986,7 @@ def main():
         messagebox.showerror(APP_NAME, "ffmpeg non è installato.\n\n"
                                        "Installalo con:\n  sudo apt install ffmpeg")
         return 1
+    ff.probe_vaapi()
     run_gui(ff, load_config())
     return 0
 

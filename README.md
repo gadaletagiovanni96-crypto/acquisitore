@@ -37,7 +37,13 @@ né un'accelerazione 3D.
   tempo reale, ricordate per ogni scheda.
 - **Arresto automatico** a fine nastro (schermo nero/blu), dopo una durata massima
   (E-180, E-240...) o con il disco quasi pieno.
-- Scheda **Converti**: crea copie MP4 compatibili con TV e telefoni, a bassa priorità.
+- Scheda **Converti**: crea copie MP4 compatibili con TV e telefoni.
+  - Usa la **codifica video della grafica Intel integrata** (VA-API / Quick Sync), molto
+    più veloce del processore sui Celeron e Pentium (es. Lenovo B50-30). Il programma
+    verifica all'avvio che funzioni; altrimenti usa il processore (x264).
+  - Si può avviare **anche durante una registrazione**: gira a priorità minima e
+    si mette in pausa da sola se la registrazione inizia a perdere fotogrammi.
+  - Mostra velocità e tempo rimanente.
 - Tutte le impostazioni vengono ricordate.
 
 ## Pensato per registrazioni di ore
