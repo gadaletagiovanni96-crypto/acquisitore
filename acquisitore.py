@@ -52,6 +52,7 @@ def default_output_dir():
 
 DEFAULTS = {
     "video_device": "",
+    "video_device_manual": False,
     "video_input": "",
     "standard": "PAL",
     "input_format": "",
@@ -284,6 +285,38 @@ class VideoDevice(object):
         self.formats = collections.OrderedDict()   # nome ffmpeg -> (descrizione, [dimensioni])
         self.inputs = []                            # [(indice, nome)]
         self.usb = None
+        self.driver = ""
+
+    @property
+    def is_uvc(self):
+        """Dispositivo UVC (webcam o schede tipo MS2109/MS210x): niente standard TV."""
+        return self.driver == "uvcvideo"
+
+    def capture_score(self, audio_devices=None):
+        """Quanto è probabile che sia una scheda di acquisizione da videocassetta."""
+        if self.path == TEST_SOURCE or not self.formats:
+            return -100
+        score = 0
+        sizes = set()
+        for _, (_, sz) in self.formats.items():
+            sizes.update(sz)
+        if "720x576" in sizes or "720x480" in sizes:
+            score += 5
+        nm = self.name.lower()
+        if any(k in nm for k in ("ms210", "ms2109", "macrosilicon", "easycap", "em28",
+                                 "stk1160", "utv007", "usbtv", "cx231", "av to usb",
+                                 "video capture", "grabber", "usb video", "capture")):
+            score += 6
+        if any(k in nm for k in ("easycamera", "webcam", "integrated", "facetime",
+                                 "hd camera", "hd webcam", "ir camera", "hp ", "lenovo",
+                                 "chicony", "realtek", "camera")):
+            score -= 8
+        if not self.is_uvc and self.driver:
+            score += 4   # em28xx, stk1160, usbtv, cx231xx... sono schede di acquisizione
+        if audio_devices and self.usb:
+            if any(a[2] == self.usb for a in audio_devices if a[2]):
+                score += 3
+        return score
 
     @property
     def label(self):
@@ -356,6 +389,10 @@ def list_video_devices(ff):
         name = read_file(sysdir + "/name").strip() or node
         d = VideoDevice(path, name)
         d.usb = usb_parent(sysdir + "/device")
+        try:
+            d.driver = os.path.basename(os.path.realpath(sysdir + "/device/driver"))
+        except OSError:
+            d.driver = ""
         if ff.path:
             d.formats = probe_video_formats(ff, path)
         d.inputs = v4l2_inputs(path)
@@ -495,7 +532,8 @@ def preview_dims(cfg):
 
 
 def build_ffmpeg_cmd(ff, cfg, record_path=None, meter_fd=None, preview_fps=12,
-                     use_v4l2ctl=False, title="", segment_seconds=0, monitor_fd=None):
+                     use_v4l2ctl=False, title="", segment_seconds=0, monitor_fd=None,
+                     tv_controls=True):
     """Comando ffmpeg per anteprima (stdout, PPM) + VU-meter (fd) + registrazione."""
     vdev = cfg["video_device"]
     adev = cfg["audio_device"] or NO_AUDIO
@@ -519,7 +557,7 @@ def build_ffmpeg_cmd(ff, cfg, record_path=None, meter_fd=None, preview_fps=12,
                 "testsrc2=size=%s:rate=%s" % (size, fps)]
     else:
         cmd += ["-f", "v4l2", "-thread_queue_size", "512"]
-        if not use_v4l2ctl:
+        if not use_v4l2ctl and tv_controls:
             if cfg.get("video_input") not in ("", None):
                 cmd += ["-channel", str(cfg["video_input"])]
             if cfg.get("standard") and cfg["standard"] != "Automatico":
@@ -1145,7 +1183,8 @@ def run_gui(ff, cfg):
             self.osd_rec = self.canvas.create_text(10, 10, anchor="nw", text="",
                                                    fill="#ff2020", font=self.font_lcd_s)
             self.osd_msg = self.canvas.create_text(sw // 2, sw * 3 // 8, text="NESSUN SEGNALE",
-                                                   fill="white", font=self.font_b)
+                                                   fill="white", font=self.font_b,
+                                                   justify="center")
 
             opt = tk.Frame(mon)
             opt.pack(fill="x", pady=(4, 0))
@@ -1264,7 +1303,8 @@ def run_gui(ff, cfg):
             g = self._groupbox(tab, "Video")
             g.pack(fill="x")
             row = tk.Frame(g)
-            self.cb_vdev, self.v_vdev = self._combo(row, width=26, cmd=self.on_video_device)
+            self.cb_vdev, self.v_vdev = self._combo(row, width=26,
+                                                    cmd=self.on_user_video_device)
             self.cb_vdev.pack(side="left", fill="x", expand=True)
             self._button(row, "Aggiorna", self.refresh_devices).pack(side="left", padx=(4, 0))
             self._row(g, 0, "Dispositivo:", row)
@@ -1474,7 +1514,7 @@ def run_gui(ff, cfg):
         def refresh_devices(self, first=False):
             if self.mode == "recording":
                 return
-            restart = self.mode == "preview"
+            restart = self.mode == "preview" or (self.mode == "idle" and self.preview_wanted)
             if self.engine and self.engine.running():
                 self.stop_engine(lambda: self._do_refresh(first, restart))
             else:
@@ -1483,27 +1523,39 @@ def run_gui(ff, cfg):
         def _do_refresh(self, first, restart):
             self.status("Ricerca dei dispositivi in corso...")
             self.root.update_idletasks()
+            self.auto_picked = False
             self.video_devices = list_video_devices(ff)
             self.video_devices.append(VideoDevice(TEST_SOURCE, "Segnale di prova (barre)"))
             self.video_devices[-1].formats["(prova)"] = ("generato", list(DEFAULT_SIZES))
             self.cb_vdev.configure(values=[d.label if d.path != TEST_SOURCE else d.name
                                            for d in self.video_devices])
-            sel = 0
-            for i, d in enumerate(self.video_devices):
-                if d.path == self.cfg["video_device"]:
-                    sel = i
-                    break
+            sel = -1
+            if self.cfg.get("video_device_manual"):
+                for i, d in enumerate(self.video_devices):
+                    if d.path == self.cfg["video_device"]:
+                        sel = i
+                        break
+            if sel < 0:
+                # Scegli da solo la periferica che sembra una scheda di acquisizione
+                # (non la webcam del portatile).
+                aud = list_audio_devices(ff)
+                scores = [d.capture_score(aud) for d in self.video_devices]
+                sel = scores.index(max(scores)) if scores else 0
+                if self.video_devices[sel].path != self.cfg["video_device"]:
+                    self.auto_picked = True
             self.cb_vdev.current(sel)
             n = len(self.video_devices) - 1
             self.log("Trovati %d dispositivi video." % n)
             for d in self.video_devices[:-1]:
-                self.log("  %s: %s" % (d.label, ", ".join(d.formats.keys()) or
-                                       "nessun formato di acquisizione"))
+                self.log("  %s [%s]: %s" % (d.label, d.driver or "?",
+                                            ", ".join(d.formats.keys()) or
+                                            "nessun formato di acquisizione"))
+            self.log("Sorgente video scelta: " + self.video_devices[sel].label)
 
             self.audio_devices = list_audio_devices(ff)
             self.cb_adev.configure(values=[a[1] for a in self.audio_devices])
             self._load_vars()
-            self.on_video_device(initial=True)
+            self.on_video_device(initial=not self.auto_picked)
             self.status("Pronto" if n else "Nessuna scheda di acquisizione trovata: "
                                            "collegala e premi Aggiorna")
             if restart and not first:
@@ -1535,6 +1587,10 @@ def run_gui(ff, cfg):
             vals = [a[0] for a in self.audio_devices]
             self.cb_adev.current(vals.index(c["audio_device"])
                                  if c["audio_device"] in vals else 0)
+
+        def on_user_video_device(self):
+            self.cfg["video_device_manual"] = True   # scelta fatta a mano: va ricordata
+            self.on_video_device()
 
         def on_video_device(self, initial=False):
             d = self.current_video()
@@ -1571,7 +1627,11 @@ def run_gui(ff, cfg):
                         cur = k
                         break
             self.cb_fmt.current(self.fmt_keys.index(cur) if cur in self.fmt_keys else 0)
-            self.on_format(restart=False)
+            self.on_format(restart=False, reset_size=not initial)
+            if not initial:
+                self.vars["framerate"].set(
+                    "29.97" if self.vars["standard"].get() in ("NTSC", "PAL-M", "NTSC-JP")
+                    else "25")
             if self.cb_adev.current() < 0 and self.audio_devices:
                 self.cb_adev.current(0)   # audio della scheda di acquisizione
             self.save_vars()
@@ -1580,7 +1640,7 @@ def run_gui(ff, cfg):
             if not initial:
                 self.on_source_change()
 
-        def on_format(self, restart=True):
+        def on_format(self, restart=True, reset_size=False):
             d = self.current_video()
             if not d:
                 return
@@ -1596,7 +1656,8 @@ def run_gui(ff, cfg):
                             sizes.append(x)
             sizes = sizes or list(DEFAULT_SIZES)
             self.cb_size.configure(values=sizes)
-            if self.vars["video_size"].get() not in sizes:
+            if reset_size or self.vars["video_size"].get() not in sizes:
+                # Risoluzione nativa delle videocassette, non quella HD della scheda
                 pref = "720x480" if self.vars["standard"].get().startswith("NTSC") else "720x576"
                 self.vars["video_size"].set(pref if pref in sizes else sizes[0])
             if restart:
@@ -1633,7 +1694,8 @@ def run_gui(ff, cfg):
             self.save_vars()
             self.update_audio_info()
             self.build_audio_controls()
-            if self.mode == "preview":
+            # Riavvia l'anteprima anche se si era fermata per un errore
+            if self.mode == "preview" or (self.mode == "idle" and self.preview_wanted):
                 self.schedule_restart()
 
         def schedule_restart(self):
@@ -1645,6 +1707,8 @@ def run_gui(ff, cfg):
             self.restart_job = None
             if self.mode == "preview":
                 self.stop_engine(self.start_preview)
+            elif self.mode == "idle" and not self.engine:
+                self.start_preview()
 
         def save_vars(self, *a):
             c = self.cfg
@@ -1776,10 +1840,12 @@ def run_gui(ff, cfg):
             """Imposta ingresso, standard e regolazioni salvate tramite v4l2-ctl."""
             if not self.use_v4l2ctl or d.path == TEST_SOURCE:
                 return
-            if self.cfg["video_input"] != "":
+            if d.is_uvc:
+                pass   # UVC: nessun ingresso/standard da impostare
+            elif self.cfg["video_input"] != "":
                 run_cmd(["v4l2-ctl", "-d", d.path, "-i", str(self.cfg["video_input"])])
             std = self.cfg["standard"]
-            if std and std != "Automatico":
+            if std and std != "Automatico" and not d.is_uvc:
                 rc, out = run_cmd(["v4l2-ctl", "-d", d.path, "-s", std.lower()])
                 if rc != 0:
                     self.log("Impossibile impostare lo standard %s: %s" % (std, out.strip()))
@@ -1870,6 +1936,7 @@ def run_gui(ff, cfg):
                 eng.start(lambda fd, mfd: build_ffmpeg_cmd(
                     ff, eff, record_path, fd, pfps,
                     use_v4l2ctl=self.use_v4l2ctl and d.path != TEST_SOURCE, title=title,
+                    tv_controls=not d.is_uvc,
                     segment_seconds=seg, monitor_fd=mfd),
                     ach, monitor=bool(self.cfg["audio_monitor"]) and avalue != NO_AUDIO)
             except RuntimeError as e:
@@ -1914,6 +1981,7 @@ def run_gui(ff, cfg):
             if self.mode != "idle":
                 return
             self.preview_wanted = True
+            self.canvas.itemconfigure(self.osd_msg, text="AVVIO...")
             if self.launch():
                 self.mode = "preview"
                 self.status("Anteprima in corso - premi REGISTRA e poi PLAY sul videoregistratore")
@@ -2157,6 +2225,7 @@ def run_gui(ff, cfg):
             if eng:
                 if eng.frame_id != self.last_frame_id and eng.frame is not None:
                     self.last_frame_id = eng.frame_id
+                    self.last_error_key = None
                     frame = eng.frame
                     show = self.mode == "preview" or self.cfg["preview_while_recording"]
                     if show:
@@ -2224,10 +2293,17 @@ def run_gui(ff, cfg):
             else:
                 title = "Impossibile avviare l'acquisizione"
                 extra = ""
-            self.status(title)
-            self.canvas.itemconfigure(self.osd_msg, text="ERRORE")
-            messagebox.showerror(APP_NAME, "%s (codice %s)%s\n\n%s\n\n%s" % (
-                title, code, extra, hint or "Dettagli:", tail[-900:]))
+            self.status(title + " - cambia sorgente o impostazioni, oppure premi Anteprima "
+                                "per riprovare")
+            self.canvas.itemconfigure(self.osd_msg, text="ERRORE\n\nCambia sorgente o\n"
+                                                         "premi Anteprima")
+            self.log("ERRORE: %s (codice %s)" % (title, code))
+            # Non ripetere la stessa finestra di errore a ogni tentativo
+            key = (was, hint, re.sub(r"0x[0-9a-f]+|\d+", "", tail[-300:]))
+            if was == "recording" or key != getattr(self, "last_error_key", None):
+                self.last_error_key = key
+                messagebox.showerror(APP_NAME, "%s (codice %s)%s\n\n%s\n\n%s" % (
+                    title, code, extra, hint or "Dettagli:", tail[-900:]))
 
         def slow_poll(self):
             try:
