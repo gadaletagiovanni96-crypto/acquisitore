@@ -209,6 +209,61 @@ def filesystem_type(path):
     return fstype
 
 
+def _read_int(path):
+    try:
+        return int(read_file(path).strip())
+    except ValueError:
+        return None
+
+
+def system_snapshot():
+    """Stato del PC in questo istante (per capire perché la registrazione scatta)."""
+    parts = []
+    cur = [_read_int(f) for f in
+           glob.glob("/sys/devices/system/cpu/cpu[0-9]*/cpufreq/scaling_cur_freq")]
+    cur = [c for c in cur if c]
+    mx = _read_int("/sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq")
+    if cur:
+        parts.append("CPU %d%s MHz" % (sum(cur) // len(cur) // 1000,
+                                       "/%d" % (mx // 1000) if mx else ""))
+    temps = [_read_int(f) for f in glob.glob("/sys/class/thermal/thermal_zone*/temp")]
+    temps = [t for t in temps if t and 0 < t < 150000]
+    if temps:
+        parts.append("%d °C" % (max(temps) // 1000))
+    load = read_file("/proc/loadavg").split()
+    if load:
+        parts.append("carico %s" % load[0])
+    mem = dict(re.findall(r"^(\w+):\s+(\d+)", read_file("/proc/meminfo"), re.M))
+    try:
+        parts.append("RAM libera %d MB" % (int(mem["MemAvailable"]) // 1024))
+        swap = (int(mem["SwapTotal"]) - int(mem["SwapFree"])) // 1024
+        if swap > 50:
+            parts.append("swap in uso %d MB" % swap)
+    except (KeyError, ValueError):
+        pass
+    return ", ".join(parts)
+
+
+def power_warnings():
+    """Cause tipiche di rallentamento sui portatili."""
+    warns = []
+    mains = [d for d in glob.glob("/sys/class/power_supply/*")
+             if read_file(d + "/type").strip() == "Mains"]
+    if mains and not any(read_file(d + "/online").strip() == "1" for d in mains):
+        warns.append("il portatile va a BATTERIA: collega l'alimentatore, a batteria il "
+                     "processore rallenta")
+    gov = read_file("/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor").strip()
+    if gov == "powersave" and not os.path.isdir("/sys/devices/system/cpu/intel_pstate"):
+        warns.append("il processore è in modalità risparmio energetico (powersave)")
+    mem = dict(re.findall(r"^(\w+):\s+(\d+)", read_file("/proc/meminfo"), re.M))
+    try:
+        if int(mem["MemAvailable"]) < 400 * 1024:
+            warns.append("poca memoria libera: chiudi gli altri programmi")
+    except (KeyError, ValueError):
+        pass
+    return warns
+
+
 class SleepInhibitor(object):
     """Impedisce la sospensione del PC durante la registrazione."""
 
@@ -590,6 +645,20 @@ def target_fps(cfg):
     return FPS_VALUES.get(cfg.get("framerate"), cfg.get("framerate") or "25")
 
 
+# Toglie solo i fotogrammi IDENTICI al precedente (i doppioni che la scheda inserisce
+# per passare da 25 a 30 fps). A differenza di decimate=cycle=6 non scarta mai un
+# fotogramma vero quando i doppioni non cadono a intervalli regolari, e costa la metà.
+DEDUP_FILTER = "mpdecimate=hi=128:lo=64:frac=0.1:max=1"
+
+
+def dedup_filter(ff):
+    if "mpdecimate" in ff.filters:
+        return DEDUP_FILTER
+    if "decimate" in ff.filters:
+        return "decimate=cycle=6"
+    return None
+
+
 def needs_decimate(source_fps, target):
     """Le schede tipo MS2109 inviano 30 fps anche con un segnale PAL a 25:
     un fotogramma su sei è un duplicato che fa 'scattare' il video."""
@@ -619,8 +688,8 @@ def conversion_filters(ff, cfg, source_fps):
     vf = []
     out_fps = source_fps
     tgt = target_fps(cfg)
-    if source_fps and needs_decimate(source_fps, tgt) and "decimate" in ff.filters:
-        vf.append("decimate=cycle=6")          # 30 fps con duplicati -> 25 fps veri
+    if source_fps and needs_decimate(source_fps, tgt) and dedup_filter(ff):
+        vf.append(dedup_filter(ff))            # 30 fps con duplicati -> 25 fps veri
         out_fps = 25.0
     if cfg.get("conv_fix_dropouts") and "blackframe" in ff.filters and out_fps:
         # Le schede economiche, quando perdono l'aggancio al segnale della cassetta,
@@ -752,8 +821,8 @@ def build_ffmpeg_cmd(ff, cfg, record_path=None, meter_fd=None, preview_fps=12,
         else:
             rec_filters = []
             if cfg.get("_device_fps") and needs_decimate(cfg["_device_fps"], target_fps(cfg)) \
-                    and "decimate" in ff.filters:
-                rec_filters.append("decimate=cycle=6")
+                    and dedup_filter(ff):
+                rec_filters.append(dedup_filter(ff))
             if cfg.get("deinterlace") in ("yadif", "bwdif"):
                 rec_filters.append("%s=0:-1:0" % cfg["deinterlace"])
             if cfg.get("head_mask"):
@@ -843,6 +912,7 @@ def audio_player_cmd():
 
 
 ERROR_HINTS = [
+    ("Thread message queue blocking", "Il PC non riesce a stare al passo con l'acquisizione."),
     ("Device or resource busy", "Il dispositivo è già in uso da un altro programma "
      "(chiudi webcam, Cheese, OBS, VLC...) oppure da PulseAudio/PipeWire."),
     ("Permission denied", "Permessi insufficienti. Esegui:\n  sudo usermod -aG video,audio $USER\n"
@@ -2142,8 +2212,10 @@ def run_gui(ff, cfg):
                 eff["_device_fps"] = self.fps_cache[key]
             eng = CaptureEngine()
             pfps = 12
-            if record_path and not self.cfg["preview_while_recording"]:
-                pfps = 1
+            if record_path:
+                # Durante la registrazione l'anteprima è più leggera: tutta la potenza
+                # del processore resta all'acquisizione.
+                pfps = 6 if self.cfg["preview_while_recording"] else 1
             title = ""
             if record_path:
                 title = os.path.splitext(os.path.basename(self.rec["base"]))[0]
@@ -2256,7 +2328,8 @@ def run_gui(ff, cfg):
                 n += 1
             self.preview_wanted = self.mode == "preview" or self.preview_wanted
             self.rec = {"base": base, "ext": ext, "seg": seg, "part": 1, "start": None,
-                        "recoveries": 0, "files": [], "drop": 0, "dup": 0}
+                        "recoveries": 0, "files": [], "drop": 0, "dup": 0,
+                        "dup_seen": 0, "stutters": [], "pending": None}
             self.chapters = []
             self.stop_engine(self._start_part)
 
@@ -2291,6 +2364,13 @@ def run_gui(ff, cfg):
                     if self.inhibitor.start():
                         self.log("Sospensione automatica del PC bloccata durante la registrazione.")
                 self.log("Registrazione avviata: " + path)
+                if r["part"] == 1 and not r["recoveries"]:
+                    snap = system_snapshot()
+                    if snap:
+                        self.log("Stato del PC: " + snap)
+                    for w in power_warnings():
+                        self.log("ATTENZIONE: " + w + ".")
+                        self.status("Attenzione: " + w)
                 self.status("REGISTRAZIONE IN CORSO -> " + os.path.basename(path))
             elif r["start"] is not None:
                 self._schedule_recovery("avvio non riuscito")
@@ -2347,6 +2427,16 @@ def run_gui(ff, cfg):
             if r["recoveries"]:
                 self.log("La registrazione è stata ripresa automaticamente %d volte."
                          % r["recoveries"])
+            self._flush_stutter(r)
+            if r["stutters"]:
+                tot = sum(n for _, n in r["stutters"])
+                self.log("ATTENZIONE: la registrazione ha scattato in %d %s (%d fotogrammi "
+                         "mancanti): %s. Il PC in quei momenti non ha tenuto il passo." % (
+                             len(r["stutters"]),
+                             "punto" if len(r["stutters"]) == 1 else "punti", tot,
+                             ", ".join(fmt_hms(t) for t, _ in r["stutters"][:20])))
+            elif dur > 10:
+                self.log("Registrazione fluida: nessun fotogramma mancante.")
             if r.get("dropouts"):
                 self.log("La scheda ha perso il segnale %d volte (immagine nera). Pulisci le "
                          "testine e regola il tracking; nella conversione i buchi vengono "
@@ -2542,6 +2632,9 @@ def run_gui(ff, cfg):
             if eng:
                 for line in eng.pop_log():
                     self.log(line)
+                    if "Thread message queue blocking" in line:
+                        self.log("-> Il PC non riesce a stare al passo: chiudi gli altri programmi "
+                                 "e collega l'alimentatore. Stato: " + system_snapshot())
             self.blink = not self.blink
             outdir = os.path.expanduser(self.cfg["output_dir"])
             try:
@@ -2577,9 +2670,11 @@ def run_gui(ff, cfg):
                     drop += int(p.get("drop_frames", "0") or 0)
                     dup += int(p.get("dup_frames", "0") or 0)
                     fps = p.get("fps", "-")
+                self._track_stutter(r, el, dup, now)
                 buchi = r.get("dropouts", 0)
-                self.st_fps.configure(text="fps %s  persi %d  buchi %d" % (fps, drop, buchi),
-                                      fg="#c00000" if drop > 25 or buchi else "black")
+                scatti = len(r["stutters"])
+                self.st_fps.configure(text="fps %s  scatti %d  buchi %d" % (fps, scatti, buchi),
+                                      fg="#c00000" if scatti or buchi else "black")
                 size = getattr(self, "rec_size", 0)
                 if free is not None and el > 10 and size > 0:
                     self.st_disk.configure(text="Libero %s (~%s)" % (
@@ -2604,6 +2699,30 @@ def run_gui(ff, cfg):
                     self.st_disk.configure(text="Spazio libero: " + fmt_size(free))
                 self._conv_guard(now, None)
             self._conv_poll()
+
+        def _track_stutter(self, r, el, dup_total, now):
+            """Un fotogramma ripetuto dal frame rate costante vuol dire che ne è mancato
+            uno vero: la registrazione ha 'scattato'. Si annota dove e lo stato del PC."""
+            new = dup_total - r["dup_seen"]
+            r["dup_seen"] = dup_total
+            pend = r["pending"]
+            if new > 0 and el > 3 and not self.nosignal:
+                if pend is None:
+                    r["pending"] = pend = {"t": el, "n": 0, "snap": system_snapshot()}
+                pend["n"] += new
+                pend["last"] = now
+            elif pend is not None and now - pend.get("last", now) > 3:
+                self._flush_stutter(r)
+
+        def _flush_stutter(self, r):
+            pend = r.get("pending")
+            if not pend:
+                return
+            r["pending"] = None
+            r["stutters"].append((pend["t"], pend["n"]))
+            self.log("SCATTO a %s: %d fotogramm%s mancant%s. Stato del PC: %s" % (
+                fmt_hms(pend["t"]), pend["n"], "o" if pend["n"] == 1 else "i",
+                "e" if pend["n"] == 1 else "i", pend["snap"] or "non disponibile"))
 
         def _watchdog(self, eng, now):
             """Se ffmpeg non produce fotogrammi per 20 s la scheda è bloccata:
