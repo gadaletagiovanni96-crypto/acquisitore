@@ -2328,8 +2328,7 @@ def run_gui(ff, cfg):
                 n += 1
             self.preview_wanted = self.mode == "preview" or self.preview_wanted
             self.rec = {"base": base, "ext": ext, "seg": seg, "part": 1, "start": None,
-                        "recoveries": 0, "files": [], "drop": 0, "dup": 0,
-                        "dup_seen": 0, "stutters": [], "pending": None}
+                        "recoveries": 0, "files": [], "drop": 0, "dup": 0}
             self.chapters = []
             self.stop_engine(self._start_part)
 
@@ -2427,16 +2426,6 @@ def run_gui(ff, cfg):
             if r["recoveries"]:
                 self.log("La registrazione è stata ripresa automaticamente %d volte."
                          % r["recoveries"])
-            self._flush_stutter(r)
-            if r["stutters"]:
-                tot = sum(n for _, n in r["stutters"])
-                self.log("ATTENZIONE: la registrazione ha scattato in %d %s (%d fotogrammi "
-                         "mancanti): %s. Il PC in quei momenti non ha tenuto il passo." % (
-                             len(r["stutters"]),
-                             "punto" if len(r["stutters"]) == 1 else "punti", tot,
-                             ", ".join(fmt_hms(t) for t, _ in r["stutters"][:20])))
-            elif dur > 10:
-                self.log("Registrazione fluida: nessun fotogramma mancante.")
             if r.get("dropouts"):
                 self.log("La scheda ha perso il segnale %d volte (immagine nera). Pulisci le "
                          "testine e regola il tracking; nella conversione i buchi vengono "
@@ -2670,11 +2659,9 @@ def run_gui(ff, cfg):
                     drop += int(p.get("drop_frames", "0") or 0)
                     dup += int(p.get("dup_frames", "0") or 0)
                     fps = p.get("fps", "-")
-                self._track_stutter(r, el, dup, now)
                 buchi = r.get("dropouts", 0)
-                scatti = len(r["stutters"])
-                self.st_fps.configure(text="fps %s  scatti %d  buchi %d" % (fps, scatti, buchi),
-                                      fg="#c00000" if scatti or buchi else "black")
+                self.st_fps.configure(text="fps %s  persi %d  buchi %d" % (fps, drop, buchi),
+                                      fg="#c00000" if drop > 25 or buchi else "black")
                 size = getattr(self, "rec_size", 0)
                 if free is not None and el > 10 and size > 0:
                     self.st_disk.configure(text="Libero %s (~%s)" % (
@@ -2699,30 +2686,6 @@ def run_gui(ff, cfg):
                     self.st_disk.configure(text="Spazio libero: " + fmt_size(free))
                 self._conv_guard(now, None)
             self._conv_poll()
-
-        def _track_stutter(self, r, el, dup_total, now):
-            """Un fotogramma ripetuto dal frame rate costante vuol dire che ne è mancato
-            uno vero: la registrazione ha 'scattato'. Si annota dove e lo stato del PC."""
-            new = dup_total - r["dup_seen"]
-            r["dup_seen"] = dup_total
-            pend = r["pending"]
-            if new > 0 and el > 3 and not self.nosignal:
-                if pend is None:
-                    r["pending"] = pend = {"t": el, "n": 0, "snap": system_snapshot()}
-                pend["n"] += new
-                pend["last"] = now
-            elif pend is not None and now - pend.get("last", now) > 3:
-                self._flush_stutter(r)
-
-        def _flush_stutter(self, r):
-            pend = r.get("pending")
-            if not pend:
-                return
-            r["pending"] = None
-            r["stutters"].append((pend["t"], pend["n"]))
-            self.log("SCATTO a %s: %d fotogramm%s mancant%s. Stato del PC: %s" % (
-                fmt_hms(pend["t"]), pend["n"], "o" if pend["n"] == 1 else "i",
-                "e" if pend["n"] == 1 else "i", pend["snap"] or "non disponibile"))
 
         def _watchdog(self, eng, now):
             """Se ffmpeg non produce fotogrammi per 20 s la scheda è bloccata:
