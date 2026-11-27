@@ -2212,10 +2212,8 @@ def run_gui(ff, cfg):
                 eff["_device_fps"] = self.fps_cache[key]
             eng = CaptureEngine()
             pfps = 12
-            if record_path:
-                # Durante la registrazione l'anteprima è più leggera: tutta la potenza
-                # del processore resta all'acquisizione.
-                pfps = 6 if self.cfg["preview_while_recording"] else 1
+            if record_path and not self.cfg["preview_while_recording"]:
+                pfps = 1
             title = ""
             if record_path:
                 title = os.path.splitext(os.path.basename(self.rec["base"]))[0]
